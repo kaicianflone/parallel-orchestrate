@@ -444,6 +444,9 @@ else
   INTEGRATION_POINT="$_BASE_SHA"
 fi
 echo "INTEGRATION_POINT: $INTEGRATION_POINT"
+# Persist the integration point so Phase 3.1's fresh-shell base check can read it
+# (it is otherwise a transient shell var). Substitute the literal wave number.
+echo "$INTEGRATION_POINT" > "$_STATE_DIR/wave-$_WAVE_NUM.base"
 
 # Telemetry: stamp wave start time so Phase 3.5 can compute duration_s.
 # Substitute the literal wave number for $_WAVE_NUM (e.g. 1, 2, 3...).
@@ -483,6 +486,17 @@ For every task in the wave, make ONE `Agent` tool call. ALL Agent calls go in th
 
 The orchestrator never sets `run_in_background` — wait for all returns.
 
+Before dispatching, persist each task's declared Touches globs so Phase 3.1's
+scope-violation check (fresh shell) can read them. One glob per line:
+
+```bash
+source "<env.sh path>"
+mkdir -p "$_STATE_DIR/touches"
+# For each task in this wave, write its Touches (writeable) globs from TASKS.md,
+# one per line. Substitute the literal task id and its glob list.
+printf '%s\n' {{TOUCHES_GLOBS_FOR_TASK}} > "$_STATE_DIR/touches/{{TASK_ID}}.txt"
+```
+
 ### Subagent prompt template
 
 Substitute every `{{...}}` from TASKS.md and Phase 0 variables before dispatching.
@@ -496,9 +510,32 @@ Substitute the literal task ID for each subagent (T01, T02, ...) when building t
 ```
 You are a focused implementation subagent for task {{TASK_ID}}: {{TASK_NAME}}.
 
-## Working directory
-You are running in a fresh, isolated git worktree managed by the harness.
-That worktree was branched from {{INTEGRATION_POINT_SHA}}.
+## Working directory — VERIFY YOUR BASE FIRST
+You run in an isolated git worktree. The harness may root it on a STALE commit, NOT
+necessarily {{INTEGRATION_POINT_SHA}}. Before ANY other step, re-seat HEAD onto the
+intended integration point:
+
+```bash
+TARGET={{INTEGRATION_POINT_SHA}}
+if ! git cat-file -e "$TARGET" 2>/dev/null; then
+  git fetch origin "$TARGET" 2>/dev/null || true
+fi
+if ! git cat-file -e "$TARGET" 2>/dev/null; then
+  echo "BASE_UNREACHABLE"   # base object not in this worktree's object DB
+  exit 0
+fi
+git reset --hard "$TARGET"
+git clean -fd
+echo "BASE_OK $(git rev-parse HEAD)"
+```
+
+If you printed `BASE_UNREACHABLE`, write your result JSON with `status="blocked"` and
+`blockers="base_unreachable: {{INTEGRATION_POINT_SHA}}"`, then STOP. Do NOT improvise on a
+different base — a from-scratch build on the wrong base silently reimplements existing work.
+
+`git reset --hard` + `git clean -fd` here are safe: the worktree is freshly created and
+disposable. They run ONLY inside your own worktree, never the main repo.
+
 Other tasks run in OTHER isolated worktrees in parallel — they cannot see your changes and you cannot see theirs.
 
 ## Project context
@@ -540,11 +577,13 @@ Anything not listed under "MAY write". If you need a forbidden file, do not impr
    jq -n \
      --arg id "{{TASK_ID}}" \
      --arg sha "$_SHA" \
+     --arg base "$(git rev-parse HEAD^ 2>/dev/null || echo "")" \
+     --arg expected_base "{{INTEGRATION_POINT_SHA}}" \
      --argjson files "$_FILES_JSON" \
      --argjson tests "$_TESTS_JSON" \
      --argjson tcount 0 \
      --arg notes "" \
-     '{task_id:$id, status:"success", commit:$sha, files_changed:$files, tests_added:$tests, tests_passing:true, tests_count:$tcount, lint_passing:true, notes:$notes}' \
+     '{task_id:$id, status:"success", commit:$sha, base_sha:$base, expected_base:$expected_base, files_changed:$files, tests_added:$tests, tests_passing:true, tests_count:$tcount, lint_passing:true, notes:$notes}' \
      > "{{RESULTS_DIR}}/{{TASK_ID}}.json"
    ```
 
@@ -555,6 +594,8 @@ Anything not listed under "MAY write". If you need a forbidden file, do not impr
   "task_id": "string",
   "status": "success" | "blocked" | "failed",
   "commit": "string or null",
+  "base_sha": "string (the commit's parent — the base you actually built on)",
+  "expected_base": "string (the integration-point SHA you were told to build on)",
   "files_changed": ["string", ...],
   "tests_added": ["string", ...],
   "tests_passing": true | false,
@@ -625,11 +666,18 @@ _WAVE_SUCCESS=0
 _WAVE_FAILED=0
 _WAVE_FIXUPS=0
 
+# Integration point this wave was supposed to build on (persisted in Phase 2.1).
+# The harness-chosen worktree base is NOT trusted — every commit must descend from this.
+INTEGRATION_POINT=$(cat "$_STATE_DIR/wave-$_WAVE_NUM.base" 2>/dev/null || echo "")
+mkdir -p "$_STATE_DIR/fail-reasons"
+
 for TASK in $(...task ids in wave...); do
   _WAVE_TASK_COUNT=$(( _WAVE_TASK_COUNT + 1 ))
   RESULT="$_STATE_DIR/results/$TASK.json"
+  rm -f "$_STATE_DIR/fail-reasons/$TASK"   # clear any stale reason from a prior pass
   if [ ! -f "$RESULT" ]; then
     echo "$TASK: MISSING_RESULT (treating as failed)"
+    echo "missing_result" > "$_STATE_DIR/fail-reasons/$TASK"
     _WAVE_FAILED=$(( _WAVE_FAILED + 1 ))
     continue
   fi
@@ -638,11 +686,44 @@ for TASK in $(...task ids in wave...); do
   COMMIT=$(jq -r '.commit // empty' "$RESULT" 2>/dev/null || echo "")
   REACHABLE="no"
   [ -n "$COMMIT" ] && git cat-file -e "$COMMIT" 2>/dev/null && REACHABLE="yes"
-  echo "$TASK: status=$STATUS tests=$TESTS commit=${COMMIT:-none} reachable=$REACHABLE"
-  # Tally success/failed for telemetry
-  if [ "$STATUS" = "success" ] && [ "$TESTS" = "true" ] && [ "$REACHABLE" = "yes" ]; then
+
+  # --- Base lineage check (item 3): commit's parent must equal the integration
+  # point, or the commit must descend from it. Rejects stale-based reimplementations. ---
+  BASE_OK="no"
+  if [ "$REACHABLE" = "yes" ] && [ -n "$INTEGRATION_POINT" ]; then
+    PARENT=$(git rev-parse "${COMMIT}^" 2>/dev/null || echo "")
+    if [ "$PARENT" = "$INTEGRATION_POINT" ] || git merge-base --is-ancestor "$INTEGRATION_POINT" "$COMMIT" 2>/dev/null; then
+      BASE_OK="yes"
+    fi
+  fi
+
+  # --- Scope-violation heuristic (item 4): a commit that modifies files outside the
+  # task's declared Touches is the signature of a from-scratch reimplementation on a
+  # stale base. Touches globs were persisted per-task in Phase 2.2. ---
+  SCOPE_OK="yes"
+  _TOUCHES_FILE="$_STATE_DIR/touches/$TASK.txt"
+  if [ "$REACHABLE" = "yes" ] && [ -s "$_TOUCHES_FILE" ]; then
+    while IFS= read -r CHANGED; do
+      [ -z "$CHANGED" ] && continue
+      _MATCH="no"
+      while IFS= read -r GLOB; do
+        [ -z "$GLOB" ] && continue
+        # shellcheck disable=SC2254 — intentional glob match against declared Touches
+        case "$CHANGED" in $GLOB) _MATCH="yes"; break ;; esac
+      done < "$_TOUCHES_FILE"
+      if [ "$_MATCH" = "no" ]; then SCOPE_OK="no"; echo "  scope: $TASK modified out-of-scope file: $CHANGED"; fi
+    done < <(git show --name-only --format= "$COMMIT" 2>/dev/null)
+  fi
+
+  echo "$TASK: status=$STATUS tests=$TESTS commit=${COMMIT:-none} reachable=$REACHABLE base_ok=$BASE_OK scope_ok=$SCOPE_OK"
+  # A task is success ONLY if all five hold. Record the dominant failure reason so
+  # Phase 3.2/3.3 (item 5) can prefer re-dispatch over conflict-resolution.
+  if [ "$STATUS" = "success" ] && [ "$TESTS" = "true" ] && [ "$REACHABLE" = "yes" ] && [ "$BASE_OK" = "yes" ] && [ "$SCOPE_OK" = "yes" ]; then
     _WAVE_SUCCESS=$(( _WAVE_SUCCESS + 1 ))
   else
+    if   [ "$BASE_OK" = "no" ];  then echo "wrong_base"      > "$_STATE_DIR/fail-reasons/$TASK"
+    elif [ "$SCOPE_OK" = "no" ]; then echo "scope_violation" > "$_STATE_DIR/fail-reasons/$TASK"
+    else echo "$STATUS" > "$_STATE_DIR/fail-reasons/$TASK"; fi
     _WAVE_FAILED=$(( _WAVE_FAILED + 1 ))
   fi
 done
@@ -663,12 +744,24 @@ A task counts as `success` ONLY when ALL hold:
 - `tests_passing == true`
 - `commit` is non-empty
 - `git cat-file -e $COMMIT` succeeds (commit is reachable in shared object DB)
+- **base lineage:** the commit's parent equals `INTEGRATION_POINT`, or the commit descends from it (`BASE_OK=yes`) — rejects stale-based builds
+- **scope:** the commit modifies no file outside the task's declared Touches (`SCOPE_OK=yes`) — catches silent reimplementation
 
-Anything else is `failed`.
+Anything else is `failed`, with the reason recorded in `$_STATE_DIR/fail-reasons/$TASK` (`wrong_base`, `scope_violation`, `missing_result`, or the raw status) for Phase 3.2/3.3 routing.
 
 ### 3.2 Block on any failure
 
-If any task is not `success`: stop. Use `AskUserQuestion`:
+If any task is not `success`: stop. First read its failure reason from
+`$_STATE_DIR/fail-reasons/$TASK`.
+
+**Base failures get re-dispatched, not patched.** If the reason is `wrong_base` or
+`scope_violation`, do NOT dispatch a conflict-resolution / fix-up subagent — that just
+builds another layer on top of a divergent reimplementation. Instead re-dispatch the
+ORIGINAL task unchanged (the subagent template now carries the Step-0 base-sync, so the
+re-run re-seats onto the integration point). Only escalate to AskUserQuestion if a
+re-dispatched task fails the base check a second time.
+
+For any other failure reason, use `AskUserQuestion`:
 
 - A) Dispatch a fix-up subagent (`Agent` with `isolation: "worktree"`) for that task with the blocker as scope
 - B) Re-shred the remaining tasks (regenerate TASKS.md from this wave forward)
@@ -687,7 +780,13 @@ for TASK in $(...task ids in wave, in dependency order from TASKS.md...); do
 done
 ```
 
-If a cherry-pick conflicts: dispatch one fix-up subagent (`Agent` with `isolation: "worktree"`) with the failing commit and conflict markers as scope. The orchestrator never resolves conflicts itself.
+If a cherry-pick conflicts: check `$_STATE_DIR/fail-reasons/$TASK` first. If the task was
+flagged `wrong_base` or `scope_violation`, the conflict is a symptom of base drift — abort
+the cherry-pick (`git cherry-pick --abort`) and re-dispatch the ORIGINAL task (Step-0
+base-sync will re-seat it) rather than patching the conflict. A conflict subagent on a
+divergent reimplementation only compounds the drift. Otherwise, dispatch one fix-up subagent
+(`Agent` with `isolation: "worktree"`) with the failing commit and conflict markers as scope.
+The orchestrator never resolves conflicts itself.
 
 **Branch invariant:** `$_BRANCH` is checked out only in the main repo, never in a subagent worktree. The Agent tool's `isolation: "worktree"` creates fresh per-agent branches automatically — they do not collide with `$_BRANCH`.
 
@@ -868,6 +967,7 @@ If yes, invoke `Skill({skill: "ship"})`. If no, leave state intact and tell the 
 - Never start Wave N+1 if any task in Wave N is not `success` (status, tests, commit reachable).
 - Always dispatch all subagents in a wave in a single message (parallel tool calls).
 - Always pass `isolation: "worktree"` to every Agent call.
+- The harness worktree base is NOT trusted. Every subagent re-seats HEAD to the integration-point SHA (template Step 0) and reports `base_sha`; the orchestrator rejects any commit whose parent is not the integration point or a descendant of it (Phase 3.1 base check). Never cherry-pick an unverified-base commit.
 - If <4 parallel tasks emerge from shredding, abort and recommend `/autoplan`.
 - If `/freeze` is active, abort.
 - The orchestrator never pushes, forks, or opens PRs. Handoff to `/ship` does that.
